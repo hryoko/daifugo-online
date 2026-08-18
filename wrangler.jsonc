@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "daifugo-online",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-19",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "ROOM", "class_name": "DaifugoRoom" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DaifugoRoom"] }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}
