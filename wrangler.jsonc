@@ -2,7 +2,7 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "daifugo-online",
   "main": "src/index.js",
-  "compatibility_date": "2026-08-19",
+  "compatibility_date": "2026-08-01",
   "assets": {
     "directory": "./public",
     "binding": "ASSETS"
