@@ -187,6 +187,53 @@ export class DaifugoRoom {
       return;
     }
 
+    if (type === "addCPU") {
+      if (playerId !== this.room.hostId) {
+        ws.send(JSON.stringify({ type: "error", message: "ホストだけがCPUを追加できます" }));
+        return;
+      }
+      if (this.room.status !== "waiting") {
+        ws.send(JSON.stringify({ type: "error", message: "ゲーム開始後はCPUを追加できません" }));
+        return;
+      }
+      if (this.room.players.length >= 6) {
+        ws.send(JSON.stringify({ type: "error", message: "満員です（最大6人）" }));
+        return;
+      }
+      const cpuCount = this.room.players.filter((p) => p.isCPU).length + 1;
+      this.room.players.push({
+        id: `cpu-${cpuCount}-${Date.now()}`,
+        name: `CPU ${cpuCount}`,
+        isCPU: true,
+        hand: [],
+        handCount: 0,
+        finished: false,
+        finishOrder: null,
+      });
+      this.room.log.push(`CPU ${cpuCount} が参加しました`);
+      await this.persistAndBroadcast();
+      return;
+    }
+
+    if (type === "removeCPU") {
+      if (playerId !== this.room.hostId) {
+        ws.send(JSON.stringify({ type: "error", message: "ホストだけがCPUを削除できます" }));
+        return;
+      }
+      if (this.room.status !== "waiting") {
+        ws.send(JSON.stringify({ type: "error", message: "ゲーム開始後はCPUを削除できません" }));
+        return;
+      }
+      for (let i = this.room.players.length - 1; i >= 0; i--) {
+        if (this.room.players[i].isCPU) {
+          this.room.players.splice(i, 1);
+          break;
+        }
+      }
+      await this.persistAndBroadcast();
+      return;
+    }
+
     if (type === "start") {
       if (this.room.players.length < 3) {
         ws.send(JSON.stringify({ type: "error", message: "3人以上必要です" }));
@@ -216,6 +263,7 @@ export class DaifugoRoom {
       this.room.demotedPlayerId = null;
       this.room.log = ["ゲーム開始！"];
       await this.persistAndBroadcast();
+      await this.maybeScheduleCPU();
       return;
     }
 
@@ -226,6 +274,7 @@ export class DaifugoRoom {
         return;
       }
       await this.persistAndBroadcast();
+      await this.maybeScheduleCPU();
       return;
     }
 
@@ -236,6 +285,7 @@ export class DaifugoRoom {
         return;
       }
       await this.persistAndBroadcast();
+      await this.maybeScheduleCPU();
       return;
     }
 
@@ -387,9 +437,9 @@ export class DaifugoRoom {
       this.clearField();
       if (justFinished) r.currentTurnIndex = nextActiveIndex(r.order, r.players, r.currentTurnIndex);
     } else {
-      if (play.kind === "set") r.field = { kind: "set", rank: play.rank, count: play.count };
-      else if (play.kind === "stairs") r.field = { kind: "stairs", suit: play.suit, startRank: play.startRank, count: play.count };
-      else r.field = { kind: "pureJoker", count: play.count };
+      if (play.kind === "set") r.field = { kind: "set", rank: play.rank, count: play.count, cards };
+      else if (play.kind === "stairs") r.field = { kind: "stairs", suit: play.suit, startRank: play.startRank, count: play.count, cards };
+      else r.field = { kind: "pureJoker", count: play.count, cards };
 
       if (rules.suitLock && play.kind === "set" && play.count === 1) {
         const suit = cards[0].suit;
@@ -402,6 +452,66 @@ export class DaifugoRoom {
       r.currentTurnIndex = nextActiveIndex(r.order, r.players, r.currentTurnIndex);
     }
     return { ok: true };
+  }
+
+  // CPUの番なら少し間を置いて自動着手をスケジュール
+  async maybeScheduleCPU() {
+    const r = this.room;
+    if (!r || r.status !== "playing") return;
+    const cur = r.players.find((p) => p.id === r.order[r.currentTurnIndex]);
+    if (cur && cur.isCPU) {
+      await this.state.storage.setAlarm(Date.now() + 1100);
+    }
+  }
+
+  async alarm() {
+    await this.ensureLoaded();
+    const r = this.room;
+    if (!r || r.status !== "playing") return;
+    const cur = r.players.find((p) => p.id === r.order[r.currentTurnIndex]);
+    if (!cur || !cur.isCPU) return;
+
+    const cards = this.decideCPUMove(cur);
+    if (cards) {
+      this.applyPlay(cur.id, cards);
+    } else {
+      this.applyPass(cur.id);
+    }
+    await this.persistAndBroadcast();
+    await this.maybeScheduleCPU();
+  }
+
+  // 簡易CPU思考：同ランクの組み合わせのみ検討（階段・Joker代用は使わない）
+  decideCPUMove(player) {
+    const r = this.room;
+    const reals = player.hand.filter((c) => c.suit !== "JOKER");
+    const jokers = player.hand.filter((c) => c.suit === "JOKER");
+    const byRank = new Map();
+    for (const c of reals) {
+      if (!byRank.has(c.rank)) byRank.set(c.rank, []);
+      byRank.get(c.rank).push(c);
+    }
+    const ranksSorted = [...byRank.keys()].sort((a, b) => strength(a, r.revolution) - strength(b, r.revolution));
+
+    if (!r.field) {
+      // 自由リード：一番弱いカードを1枚出す
+      if (ranksSorted.length > 0) return [byRank.get(ranksSorted[0])[0]];
+      if (jokers.length > 0) return [jokers[0]];
+      return null;
+    }
+
+    if (r.field.kind === "set") {
+      for (const rank of ranksSorted) {
+        const group = byRank.get(rank);
+        if (group.length >= r.field.count && strength(rank, r.revolution) > strength(r.field.rank, r.revolution)) {
+          return group.slice(0, r.field.count);
+        }
+      }
+      return null; // 出せなければパス
+    }
+
+    // 階段・Joker単体の場は簡易CPUは対応せずパス
+    return null;
   }
 
   applyPass(playerId) {
