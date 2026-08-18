@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>大富豪オンライン</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { -webkit-tap-highlight-color: transparent; }
+  .card { width:56px; height:80px; }
+  .card.small { width:40px; height:56px; }
+</style>
+</head>
+<body class="bg-indigo-950 min-h-screen">
+<div id="app" class="min-h-screen"></div>
+
+<script>
+const RANK_LABEL = r => ({11:"J",12:"Q",13:"K",14:"A",15:"2",16:"Joker"}[r] || String(r));
+const SUIT_SYMBOL = {S:"♠",H:"♥",D:"♦",C:"♣",JOKER:"★"};
+const SUIT_COLOR = {S:"text-stone-900",C:"text-stone-900",H:"text-rose-600",D:"text-rose-600",JOKER:"text-violet-600"};
+
+function uuid(){ return crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2); }
+function strength(rank, revolution){ return revolution ? -rank : rank; }
+function sortHand(hand, revolution){
+  return [...hand].sort((a,b)=>{
+    const sa = a.suit==="JOKER" ? 999 : strength(a.rank, revolution);
+    const sb = b.suit==="JOKER" ? 999 : strength(b.rank, revolution);
+    return sa-sb;
+  });
+}
+function rankLabelForFinish(order, total, playerId, demotedPlayerId){
+  if(demotedPlayerId && playerId===demotedPlayerId && order!==1) return "大貧民（都落ち）";
+  if(order===1) return "大富豪";
+  if(order===total) return "大貧民";
+  if(total>=4){ if(order===2) return "富豪"; if(order===total-1) return "貧民"; }
+  return "平民";
+}
+function badgeColor(label){
+  if(label.startsWith("大富豪")) return "bg-amber-400 text-amber-950";
+  if(label.startsWith("富豪")) return "bg-slate-300 text-slate-900";
+  if(label.startsWith("平民")) return "bg-stone-400 text-stone-950";
+  if(label.startsWith("貧民")) return "bg-orange-800 text-orange-100";
+  if(label.startsWith("大貧民")) return "bg-rose-900 text-rose-100";
+  return "bg-stone-500 text-white";
+}
+
+const RULE_DEFS = [
+  { key: "revolution", label: "革命", desc: "同じ数字を4枚出すと強弱が逆転" },
+  { key: "eightCut", label: "8切り", desc: "8を出すと場が流れ、続けて自分の番に" },
+  { key: "suitLock", label: "スート縛り", desc: "同じスートの1枚出しが連続すると、場が流れるまで縛られる" },
+  { key: "kaidan", label: "階段", desc: "同じスートの連番を3枚以上まとめて出せる" },
+  { key: "spade3Return", label: "スペ3返し", desc: "Joker単体に♠3で対抗して場を流せる（要ジョーカー）" },
+  { key: "miyakoOchi", label: "都落ち", desc: "前回の大富豪が1位を逃すと大貧民に降格" },
+];
+const AGARI_DEFS = [
+  { key: "two", label: "2で上がり禁止" },
+  { key: "eight", label: "8切りで上がり禁止" },
+  { key: "joker", label: "Jokerを含む上がり禁止" },
+  { key: "spade3", label: "♠3単体での上がり禁止" },
+];
+
+const state = {
+  playerId: localStorage.getItem("daifugo-pid") || uuid(),
+  name: localStorage.getItem("daifugo-name") || "",
+  screen: "home",
+  room: null,
+  error: "",
+  selected: [],
+  ws: null,
+  code: null,
+  showRules: false,
+  draftRules: null,
+};
+localStorage.setItem("daifugo-pid", state.playerId);
+
+function wsUrl(code){
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${location.host}/api/room/${code}/ws`;
+}
+
+function connect(code, onOpenMsg){
+  if(state.ws) state.ws.close();
+  const ws = new WebSocket(wsUrl(code));
+  ws.onopen = () => ws.send(JSON.stringify(onOpenMsg));
+  ws.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    if(data.type === "state"){
+      state.room = data.room;
+      state.error = "";
+      if(!state.draftRules) state.draftRules = JSON.parse(JSON.stringify(data.room.rules));
+      if(data.room.status === "playing") state.screen = "game";
+      else if(data.room.status === "finished") state.screen = "finished";
+      else if(state.screen !== "lobby") state.screen = "lobby";
+    } else if(data.type === "error"){
+      state.error = data.message;
+    }
+    render();
+  };
+  state.ws = ws;
+  state.code = code;
+}
+
+function createRoom(){
+  state.name = document.getElementById("name-input").value.trim();
+  if(!state.name){ state.error = "名前を入力してください"; render(); return; }
+  localStorage.setItem("daifugo-name", state.name);
+  const code = Array.from({length:4}, () => "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"[Math.floor(Math.random()*32)]).join("");
+  connect(code, { type:"create", playerId: state.playerId, name: state.name, code });
+}
+function joinRoom(){
+  state.name = document.getElementById("name-input").value.trim();
+  const code = document.getElementById("code-input").value.trim().toUpperCase();
+  if(!state.name){ state.error = "名前を入力してください"; render(); return; }
+  if(!code){ state.error = "部屋コードを入力してください"; render(); return; }
+  localStorage.setItem("daifugo-name", state.name);
+  connect(code, { type:"join", playerId: state.playerId, name: state.name });
+}
+function startGame(){ state.ws.send(JSON.stringify({type:"start", playerId: state.playerId})); }
+function rematch(){ state.ws.send(JSON.stringify({type:"rematch", playerId: state.playerId})); }
+function toggleRulesPanel(){ state.showRules = !state.showRules; render(); }
+
+function updateDraftRule(key, value){
+  state.draftRules[key] = value;
+  render();
+}
+function updateDraftAgari(key, value){
+  state.draftRules.forbiddenAgari[key] = value;
+  render();
+}
+function applyRules(){
+  state.ws.send(JSON.stringify({ type:"setRules", playerId: state.playerId, rules: state.draftRules }));
+}
+
+function toggleSelect(card){
+  const i = state.selected.findIndex(c => c.id === card.id);
+  if(i>=0) state.selected.splice(i,1); else state.selected.push(card);
+  render();
+}
+function submitPlay(){
+  if(state.selected.length===0){ state.error="カードを選んでください"; render(); return; }
+  state.ws.send(JSON.stringify({type:"play", playerId: state.playerId, cards: state.selected}));
+  state.selected = [];
+}
+function submitPass(){
+  state.ws.send(JSON.stringify({type:"pass", playerId: state.playerId}));
+}
+
+function cardFace(card, selected, clickable, small){
+  const cls = `card ${small?"small":""} relative flex flex-col items-center justify-center rounded-lg border-2 shadow-md transition-transform ${selected?"border-amber-400 bg-amber-50 -translate-y-3":"border-stone-300 bg-stone-50"} ${clickable?"cursor-pointer active:scale-95":""}`;
+  const label = card.suit === "JOKER" ? "JKR" : RANK_LABEL(card.rank);
+  return `<button onclick="${clickable?`toggleSelect(${JSON.stringify(card).replace(/"/g,'&quot;')})`:''}" class="${cls}">
+    <span class="font-bold text-lg ${SUIT_COLOR[card.suit]}">${label}</span>
+    <span class="${SUIT_COLOR[card.suit]}">${SUIT_SYMBOL[card.suit]}</span>
+  </button>`;
+}
+
+function fieldDisplay(field){
+  if(!field) return `<p class="text-emerald-200 text-sm">場は空です（自由に出せます）</p>`;
+  if(field.kind === "pureJoker"){
+    return `<div class="flex gap-1">${Array.from({length:field.count}).map(()=>cardFace({suit:"JOKER",rank:16},false,false,true)).join("")}</div>`;
+  }
+  if(field.kind === "stairs"){
+    const cards = Array.from({length:field.count}).map((_,i)=>({suit:field.suit, rank:field.startRank+i}));
+    return `<div class="flex gap-1">${cards.map(c=>cardFace(c,false,false,true)).join("")}</div>`;
+  }
+  return `<div class="flex gap-1">${Array.from({length:field.count}).map(()=>cardFace({suit:"S",rank:field.rank},false,false,true)).join("")}</div>`;
+}
+
+function rulesSummaryText(rules){
+  const on = RULE_DEFS.filter(d => rules[d.key]).map(d=>d.label);
+  const parts = [...on];
+  if(rules.jokerCount > 0) parts.push(`ジョーカー${rules.jokerCount}枚`);
+  return parts.length ? parts.join(" / ") : "基本ルールのみ";
+}
+
+function rulesPanel(editable){
+  const rules = editable ? state.draftRules : state.room.rules;
+  return `
+  <div class="bg-indigo-900/50 rounded-xl border border-indigo-700 p-4 mb-4 text-left">
+    <div class="flex justify-between items-center mb-3">
+      <p class="text-amber-300 font-bold text-sm">ルール設定</p>
+      ${!editable ? '<span class="text-indigo-400 text-xs">閲覧のみ（ホストが設定）</span>' : ''}
+    </div>
+    <div class="space-y-3 mb-3">
+      ${RULE_DEFS.map(d => `
+        <label class="flex items-start gap-2 ${editable?"cursor-pointer":""}">
+          <input type="checkbox" ${rules[d.key] ? "checked" : ""} ${editable?"":"disabled"}
+            onchange="updateDraftRule('${d.key}', this.checked)"
+            class="mt-1 accent-amber-500" />
+          <span>
+            <span class="text-white text-sm block">${d.label}</span>
+            <span class="text-indigo-400 text-xs">${d.desc}</span>
+          </span>
+        </label>
+      `).join("")}
+      <label class="flex items-center justify-between">
+        <span class="text-white text-sm">ジョーカー枚数</span>
+        <select onchange="updateDraftRule('jokerCount', parseInt(this.value))" ${editable?"":"disabled"}
+          class="bg-indigo-950 border border-indigo-700 text-white text-sm rounded px-2 py-1">
+          ${[0,1,2].map(n=>`<option value="${n}" ${rules.jokerCount===n?"selected":""}>${n}枚</option>`).join("")}
+        </select>
+      </label>
+    </div>
+    <p class="text-indigo-300 text-xs font-bold mb-2">反則上がり（このカードで最後に上がれない）</p>
+    <div class="space-y-2">
+      ${AGARI_DEFS.map(d => `
+        <label class="flex items-center gap-2 ${editable?"cursor-pointer":""}">
+          <input type="checkbox" ${rules.forbiddenAgari[d.key] ? "checked" : ""} ${editable?"":"disabled"}
+            onchange="updateDraftAgari('${d.key}', this.checked)"
+            class="accent-amber-500" />
+          <span class="text-white text-sm">${d.label}</span>
+        </label>
+      `).join("")}
+    </div>
+    ${editable ? `<button onclick="applyRules()" class="w-full mt-4 py-2 rounded-lg bg-emerald-600 text-white font-bold text-sm">この設定を適用</button>` : ""}
+  </div>`;
+}
+
+function render(){
+  const app = document.getElementById("app");
+  if(state.screen === "home"){
+    app.innerHTML = `
+    <div class="min-h-screen flex items-center justify-center p-4">
+      <div class="w-full max-w-sm bg-indigo-900/60 border border-amber-400/30 rounded-2xl p-6 shadow-xl">
+        <h1 class="text-3xl font-serif text-amber-300 text-center mb-1 tracking-wide">大富豪</h1>
+        <p class="text-indigo-200 text-center text-sm mb-6">友達とオンライン対戦</p>
+        <label class="block text-indigo-200 text-sm mb-1">名前</label>
+        <input id="name-input" value="${state.name}" placeholder="例）コヤネ" class="w-full mb-4 px-3 py-2 rounded-lg bg-indigo-950 border border-indigo-700 text-white placeholder-indigo-500" />
+        <button onclick="createRoom()" class="w-full py-3 rounded-lg bg-amber-500 text-amber-950 font-bold mb-3 active:scale-95 transition">部屋を作る</button>
+        <div class="flex items-center gap-2 my-3">
+          <div class="h-px flex-1 bg-indigo-700"></div><span class="text-indigo-400 text-xs">または</span><div class="h-px flex-1 bg-indigo-700"></div>
+        </div>
+        <input id="code-input" placeholder="部屋コード（例：A1B2）" maxlength="4" class="w-full mb-3 px-3 py-2 rounded-lg bg-indigo-950 border border-indigo-700 text-white placeholder-indigo-500 tracking-widest text-center uppercase" />
+        <button onclick="joinRoom()" class="w-full py-3 rounded-lg bg-emerald-600 text-white font-bold active:scale-95 transition">部屋に参加する</button>
+        ${state.error?`<p class="text-rose-400 text-sm mt-4 text-center">${state.error}</p>`:""}
+      </div>
+    </div>`;
+    return;
+  }
+
+  const r = state.room;
+  if(!r){ app.innerHTML = `<div class="min-h-screen flex items-center justify-center text-indigo-300">接続中…</div>`; return; }
+  const me = r.players.find(p => p.id === state.playerId);
+  const isHost = r.hostId === state.playerId;
+
+  if(state.screen === "lobby"){
+    app.innerHTML = `
+    <div class="min-h-screen p-4">
+      <div class="max-w-sm mx-auto">
+        <h2 class="text-xl font-serif text-amber-300 text-center mt-4 mb-1">部屋コード</h2>
+        <div class="text-4xl font-bold text-white text-center tracking-[0.4em] mb-1">${r.code}</div>
+        <p class="text-indigo-300 text-center text-xs mb-6">友達にこのコードを伝えてください</p>
+        <div class="bg-indigo-900/50 rounded-xl border border-indigo-700 p-4 mb-4">
+          <p class="text-indigo-200 text-sm mb-2">参加者（${r.players.length}/6）</p>
+          <ul class="space-y-1">
+            ${r.players.map(p => `<li class="flex items-center gap-2 text-white">
+              <span class="w-2 h-2 rounded-full bg-emerald-400"></span>${p.name}
+              ${p.id===r.hostId?'<span class="text-amber-400 text-xs">(ホスト)</span>':''}
+              ${p.id===state.playerId?'<span class="text-indigo-400 text-xs">(あなた)</span>':''}
+            </li>`).join("")}
+          </ul>
+        </div>
+
+        <button onclick="toggleRulesPanel()" class="w-full py-2 mb-2 rounded-lg bg-indigo-800/60 border border-indigo-700 text-indigo-200 text-sm flex items-center justify-between px-4">
+          <span>ルール設定を${state.showRules?"隠す":"表示"}</span>
+          <span class="text-indigo-400 text-xs">${rulesSummaryText(r.rules)}</span>
+        </button>
+        ${state.showRules ? rulesPanel(isHost) : ""}
+
+        ${isHost
+          ? `<button onclick="startGame()" ${r.players.length<3?"disabled":""} class="w-full py-3 rounded-lg bg-amber-500 text-amber-950 font-bold disabled:opacity-40">${r.players.length<3?"3人以上で開始できます":"ゲーム開始"}</button>`
+          : `<p class="text-indigo-300 text-center">ホストの開始を待っています…</p>`}
+        ${state.error?`<p class="text-rose-400 text-sm mt-4 text-center">${state.error}</p>`:""}
+      </div>
+    </div>`;
+    return;
+  }
+
+  if(state.screen === "game" && me){
+    const others = r.players.filter(p => p.id !== state.playerId);
+    const isMyTurn = r.status==="playing" && r.order[r.currentTurnIndex] === state.playerId;
+    const hand = sortHand(me.hand || [], r.revolution);
+    app.innerHTML = `
+    <div class="min-h-screen flex flex-col">
+      <div class="p-3 flex justify-between items-center text-indigo-300 text-xs">
+        <span>部屋 ${r.code}</span>
+        <span class="flex gap-2">
+          ${r.revolution?'<span class="text-rose-400 font-bold">革命中</span>':''}
+          ${r.suitLockActive?`<span class="text-cyan-400 font-bold">縛り:${r.suitLockActive}</span>`:''}
+        </span>
+      </div>
+      <div class="flex flex-wrap justify-center gap-2 px-3 mb-2">
+        ${others.map(p => `<div class="px-3 py-2 rounded-xl border text-center ${r.order[r.currentTurnIndex]===p.id?"border-amber-400 bg-amber-400/10":"border-indigo-700 bg-indigo-900/40"}">
+          <div class="text-white text-sm font-medium">${p.name}</div>
+          <div class="text-indigo-300 text-xs">${p.finished?"あがり":`残${p.handCount}枚`}</div>
+        </div>`).join("")}
+      </div>
+      <div class="flex-1 flex items-center justify-center bg-emerald-900/40 mx-3 rounded-2xl border border-emerald-700 my-2 min-h-[120px]">
+        ${fieldDisplay(r.field)}
+      </div>
+      <div class="px-4 text-indigo-400 text-xs h-5 truncate text-center">${r.log[r.log.length-1]||""}</div>
+      <div class="text-center py-2">
+        <span class="text-sm font-bold ${isMyTurn?"text-amber-300":"text-indigo-400"}">
+          ${isMyTurn ? "あなたの番です" : `${r.players.find(p=>p.id===r.order[r.currentTurnIndex])?.name || ""} の番`}
+        </span>
+      </div>
+      <div class="bg-indigo-900/70 border-t border-indigo-700 p-3">
+        <div class="flex gap-1 overflow-x-auto pb-2">
+          ${hand.map(c => cardFace(c, state.selected.some(s=>s.id===c.id), true, false)).join("")}
+        </div>
+        ${state.error?`<p class="text-rose-400 text-xs mb-2 text-center">${state.error}</p>`:""}
+        <div class="flex gap-2">
+          <button onclick="submitPlay()" ${!isMyTurn?"disabled":""} class="flex-1 py-3 rounded-lg bg-amber-500 text-amber-950 font-bold disabled:opacity-30">出す</button>
+          <button onclick="submitPass()" ${!isMyTurn || !r.field?"disabled":""} class="flex-1 py-3 rounded-lg bg-indigo-700 text-white font-bold disabled:opacity-30">パス</button>
+        </div>
+      </div>
+    </div>`;
+    return;
+  }
+
+  if(state.screen === "finished"){
+    const ranked = [...r.players].sort((a,b)=>(a.finishOrder||99)-(b.finishOrder||99));
+    app.innerHTML = `
+    <div class="min-h-screen p-4 flex flex-col items-center justify-center">
+      <h2 class="text-2xl font-serif text-amber-300 mb-6">結果発表</h2>
+      <div class="w-full max-w-sm space-y-2 mb-6">
+        ${ranked.map(p => {
+          const label = rankLabelForFinish(p.finishOrder, r.players.length, p.id, r.demotedPlayerId);
+          return `<div class="flex items-center justify-between bg-indigo-900/50 border border-indigo-700 rounded-xl px-4 py-3">
+            <span class="text-white font-medium">${p.name}</span>
+            <span class="px-3 py-1 rounded-full text-xs font-bold ${badgeColor(label)}">${label}</span>
+          </div>`;
+        }).join("")}
+      </div>
+      ${isHost ? `<button onclick="rematch()" class="px-6 py-3 rounded-lg bg-amber-500 text-amber-950 font-bold">もう一度遊ぶ</button>` : ""}
+    </div>`;
+    return;
+  }
+}
+
+render();
+</script>
+</body>
+</html>
